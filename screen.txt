@@ -1,0 +1,90 @@
+if (ObjC.available) {
+    ObjC.schedule(ObjC.mainQueue, function () {
+        try {
+            console.log("🔍 Searching for screenshot protection methods...");
+
+            // 1️⃣ Disable UIApplicationSceneDeactivationManager
+            var SceneDeactivationManager = ObjC.classes.UIApplicationSceneDeactivationManager;
+            if (SceneDeactivationManager && SceneDeactivationManager["- deactivateScenesWithReasons:transitionContext:"]) {
+                Interceptor.attach(SceneDeactivationManager["- deactivateScenesWithReasons:transitionContext:"].implementation, {
+                    onEnter: function (args) {
+                        console.log("🚫 Blocking Scene Deactivation...");
+                        args[1] = ptr('0');  // Ensure it's a pointer
+                    }
+                });
+            }
+
+            // 2️⃣ Hook UIScreen isCaptured
+            var UIScreen = ObjC.classes.UIScreen;
+            if (UIScreen && UIScreen["- isCaptured"]) {
+                Interceptor.attach(UIScreen["- isCaptured"].implementation, {
+                    onLeave: function (retval) {
+                        console.log("🛑 Preventing screen recording detection...");
+                        retval.replace(0);
+                    }
+                });
+            }
+
+            // 3️⃣ Hook UIWindow _isSecure
+            var UIWindow = ObjC.classes.UIWindow;
+            if (UIWindow && UIWindow["- _isSecure"]) {
+                Interceptor.attach(UIWindow["- _isSecure"].implementation, {
+                    onLeave: function (retval) {
+                        console.log("🔓 Allowing screenshots...");
+                        retval.replace(0);
+                    }
+                });
+            }
+
+            // 4️⃣ Hook allowsScreenCapture
+            if (UIWindow && UIWindow["- allowsScreenCapture"]) {
+                Interceptor.attach(UIWindow["- allowsScreenCapture"].implementation, {
+                    onLeave: function (retval) {
+                        console.log("🖼️ Enabling screen capture...");
+                        retval.replace(1);
+                    }
+                });
+            }
+
+            // 5️⃣ Hook UIView setHidden (Prevent hiding screen on screenshot)
+            var UIView = ObjC.classes.UIView;
+            if (UIView && UIView["- setHidden:"]) {
+                Interceptor.attach(UIView["- setHidden:"].implementation, {
+                    onEnter: function (args) {
+                        console.log("🚫 Preventing view from being hidden...");
+                        args[2] = ptr('0'); // Ensure it's a pointer
+                    }
+                });
+            }
+
+            // 6️⃣ Hook AVAudioSession isOtherAudioPlaying (Prevents audio-based screen recording detection)
+            var AVAudioSession = ObjC.classes.AVAudioSession;
+            if (AVAudioSession && AVAudioSession["- isOtherAudioPlaying"]) {
+                Interceptor.attach(AVAudioSession["- isOtherAudioPlaying"].implementation, {
+                    onLeave: function (retval) {
+                        console.log("🔇 Preventing screen recording audio detection...");
+                        retval.replace(0);
+                    }
+                });
+            }
+
+            // 7️⃣ Hook Secure Text Fields (Some apps prevent screenshots via Secure Text Entry)
+            var UITextField = ObjC.classes.UITextField;
+            if (UITextField && UITextField["- setSecureTextEntry:"]) {
+                Interceptor.attach(UITextField["- setSecureTextEntry:"].implementation, {
+                    onEnter: function (args) {
+                        console.log("🔓 Disabling Secure Text Entry...");
+                        args[2] = ptr('0'); // Prevents iOS from treating the field as sensitive
+                    }
+                });
+            }
+
+            console.log("✅ Screenshot & Screen Recording protections bypassed!");
+
+        } catch (err) {
+            console.log("❌ Error: " + err.message);
+        }
+    });
+} else {
+    console.log("❌ Objective-C runtime is not available.");
+}
