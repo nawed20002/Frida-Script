@@ -1,0 +1,85 @@
+/* 
+ * Universal iOS SSL Bypass
+ * Supports iOS versions using libboringssl.dylib and libssl.dylib
+ * Based on SSL-Kill-Switch2 and other Frida scripts
+ * Author: @apps3c (Modified & Improved)
+ */
+
+function bypassSSL() {
+    var SSL_VERIFY_NONE = 0;
+    var ssl_set_custom_verify, ssl_get_psk_identity;
+
+    var boringssl_loaded = false;
+    var legacy_ssl_loaded = false;
+
+    try {
+        Module.ensureInitialized("libboringssl.dylib");
+        boringssl_loaded = true;
+        console.log("[+] libboringssl.dylib loaded");
+    } catch (err) {
+        console.log("[!] libboringssl.dylib not found, checking older libraries...");
+    }
+
+    try {
+        Module.ensureInitialized("libssl.35.dylib");
+        legacy_ssl_loaded = true;
+        console.log("[+] libssl.35.dylib (older iOS) loaded");
+    } catch (err) {
+        console.log("[!] libssl.35.dylib not found, proceeding with available libraries...");
+    }
+
+    // Function to create a native hook for SSL_set_custom_verify
+    function hookSSL(library) {
+        try {
+            ssl_set_custom_verify = new NativeFunction(
+                Module.findExportByName(library, "SSL_set_custom_verify"),
+                'void', ['pointer', 'int', 'pointer']
+            );
+
+            var ssl_verify_result_t = new NativeCallback(function (ssl, out_alert) {
+                return SSL_VERIFY_NONE;
+            }, 'int', ['pointer', 'pointer']);
+
+            Interceptor.replace(ssl_set_custom_verify, new NativeCallback(function (ssl, mode, callback) {
+                console.log("[+] Hooked SSL_set_custom_verify in " + library);
+                ssl_set_custom_verify(ssl, mode, ssl_verify_result_t);
+            }, 'void', ['pointer', 'int', 'pointer']));
+
+        } catch (err) {
+            console.log("[-] Failed to hook SSL_set_custom_verify in " + library);
+        }
+    }
+
+    // Function to hook SSL_get_psk_identity
+    function hookPSKIdentity(library) {
+        try {
+            ssl_get_psk_identity = new NativeFunction(
+                Module.findExportByName(library, "SSL_get_psk_identity"),
+                'pointer', ['pointer']
+            );
+
+            Interceptor.replace(ssl_get_psk_identity, new NativeCallback(function (ssl) {
+                console.log("[+] Hooked SSL_get_psk_identity in " + library);
+                return "notarealPSKidentity";
+            }, 'pointer', ['pointer']));
+
+        } catch (err) {
+            console.log("[-] Failed to hook SSL_get_psk_identity in " + library);
+        }
+    }
+
+    // Hook both libraries if available
+    if (boringssl_loaded) {
+        hookSSL("libboringssl.dylib");
+        hookPSKIdentity("libboringssl.dylib");
+    }
+    if (legacy_ssl_loaded) {
+        hookSSL("libssl.35.dylib");
+        hookPSKIdentity("libssl.35.dylib");
+    }
+
+    console.log("[+] SSL Bypass successfully loaded!");
+}
+
+// Execute the bypass
+bypassSSL();
