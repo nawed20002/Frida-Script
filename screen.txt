@@ -1,3 +1,7 @@
+/* 
+Frida Script to Bypass Screenshot Protect for ios
+By Naved (Nawed2002)
+*/
 if (ObjC.available) {
     ObjC.schedule(ObjC.mainQueue, function () {
         try {
