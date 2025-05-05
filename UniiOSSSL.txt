@@ -3,7 +3,7 @@
  * Supports iOS versions using libboringssl.dylib and libssl.dylib
  * Based on SSL-Kill-Switch2 and other Frida scripts
  * Author: @apps3c (Modified & Improved)
-* Modification by : nawed2002
+* ReModification by : nawed2002
  */
 
 function bypassSSL() {
