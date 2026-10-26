@@ -1,0 +1,612 @@
+/* ============================================================
+ *  Protecttai-Bypass -> Frida port  [v4]
+ *  Original Xposed module: github.com/reveny/Protecttai-Bypass
+ *
+ *  v4 adds: (1) target persistence/self-tuning, (2) caller-aware
+ *  scoring, (3) auto-heal watchdog + decoy recovery.
+ *
+ *  Run:  frida -U -f com.kotak.neo -l protecttai_v4.js --no-pause
+ *  Live: rpc.exports.status() | .report() | .enforce("f.g#u1")
+ *        .save() | .forget() | .rearm() | .stop()
+ * ============================================================ */
+
+'use strict';
+
+var CONFIG = {
+    // ---- matching ----
+    signatures: [["java.lang.String", "int", "int", "int", "java.lang.String", "int"]],
+    matchMode:    "exact",
+    includeClasses: null,
+    excludeClasses: null,
+    forceClass:   null,
+    autoPreset:   true,
+
+    // ---- behaviour ----
+    mode:          "hook",
+    enforceReturn: "default",
+    customReturn:  null,
+    originalCallMode: "this",
+    logArgs:       false,
+    maxHitLogs:    5,
+
+    // ---- discovery ----
+    minScore:        40,
+    initialDelayMs:  300,
+    scanIntervalMs:  500,
+    scanMaxIntervalMs: 4000,
+    maxScans:        120,
+    postScans:       4,
+    maxProbeCandidates: 12,
+
+    // ---- probing ----
+    probeWindowMs:  4000,
+    earlyPromote:   true,
+    captureStack:   true,
+    maxStackFrames: 12,
+
+    // ---- #1 persistence ----
+    persist:        true,
+    persistPath:    null,   // null = <app filesDir>/protecttai_targets.json
+    usePersisted:   true,
+    persistRetries: 10,
+
+    // ---- #2 caller scoring ----
+    callerScoring:  true,
+
+    // ---- #3 auto-heal ----
+    watchdog:          true,
+    watchdogIntervalMs: 5000,
+    decoyGraceMs:      12000,
+    autoReDiscover:    true,
+
+    // ---- output ----
+    verbose:     true,
+    jsonSummary: true,
+    tag:         "[protecttai]"
+};
+
+var PRESETS = {
+    "com.kotak.neo":               [["java.lang.String", "int", "int", "int", "java.lang.String", "int"]],
+    "com.csam.icici.bank.imobile": [["java.lang.String", "int", "int", "int", "java.lang.String", "int"]]
+};
+
+var SIGS = CONFIG.signatures;
+var startMs = Date.now();
+
+function log(m) { if (CONFIG.verbose) console.log(CONFIG.tag + " " + m); }
+function keyOf(c) { return c.className + "#" + c.methodName; }
+function findByKey(k) { for (var i = 0; i < all.length; i++) if (keyOf(all[i]) === k) return all[i]; return null; }
+
+function defaultFor(t) {
+    switch (t) {
+        case "void":    return undefined;
+        case "boolean": return false;
+        case "byte": case "short": case "char":
+        case "int":  case "long":  case "float": case "double": return 0;
+        default:        return null;
+    }
+}
+
+/* ---------------- matching ---------------- */
+
+var INCLUDE_RE = null, EXCLUDE_RE = null;
+try { if (CONFIG.includeClasses) INCLUDE_RE = new RegExp(CONFIG.includeClasses); } catch (e) {}
+try { if (CONFIG.excludeClasses) EXCLUDE_RE = new RegExp(CONFIG.excludeClasses); } catch (e) {}
+
+var SKIP = /^(java|javax|sun|com\.sun|jdk|android|androidx|dalvik|kotlin|kotlinx|org\.apache|org\.json|org\.xml|org\.w3c|org\.bouncycastle|junit|com\.google|com\.facebook|okhttp3|okio|retrofit2|com\.squareup|io\.reactivex|com\.crashlytics|com\.fasterxml|com\.newrelic|com\.appsflyer|com\.adjust|com\.clevertap|com\.moengage|com\.mixpanel|com\.bugsnag|com\.sentry|bolts|net\.sqlcipher|com\.github|de\.robv)\./;
+
+function shouldInspect(name) {
+    if (!name || name[0] === "[") return false;
+    if (EXCLUDE_RE && EXCLUDE_RE.test(name)) return false;
+    if (INCLUDE_RE) return INCLUDE_RE.test(name);
+    if (/protect/i.test(name)) return true;
+    return !SKIP.test(name);
+}
+
+function resolve(name) {
+    try { return Java.use(name); } catch (e) {}
+    try {
+        var loaders = Java.enumerateClassLoadersSync();
+        for (var i = 0; i < loaders.length; i++) {
+            try { var c = loaders[i].loadClass(name); if (c) return c; } catch (e) {}
+        }
+    } catch (e) {}
+    return null;
+}
+
+function loaderId(klass) {
+    try {
+        var l = klass.class.getClassLoader();
+        if (!l) return "boot";
+        return "" + Java.use("java.lang.System").identityHashCode(l);
+    } catch (e) { return "?"; }
+}
+
+function matchSig(ptypes) {
+    var names = [];
+    for (var i = 0; i < ptypes.length; i++) names.push(ptypes[i].getName());
+    for (var s = 0; s < SIGS.length; s++) {
+        var sig = SIGS[s];
+        if (sig.length !== names.length) continue;
+        if (CONFIG.matchMode === "argcount") return names;
+        var ok = true;
+        for (var k = 0; k < sig.length; k++) if (sig[k] !== names[k]) { ok = false; break; }
+        if (ok) return names;
+    }
+    return null;
+}
+
+function staticScore(className, methodName, returnType) {
+    var s = 0, segs = className.split(".");
+    var allShort    = segs.every(function (x) { return x.length <= 2; });
+    var mostlyShort = segs.every(function (x) { return x.length <= 3; });
+    if (allShort) s += 45; else if (mostlyShort) s += 25;
+    if (/^[a-z]{1,2}[0-9]?$/.test(methodName)) s += 25;
+    else if (methodName.length <= 3) s += 12;
+    if (segs.length === 2 && segs[0].length <= 2) s += 15;
+    if (returnType === "void" || returnType === "boolean") s += 6;
+    if (/protect/i.test(className)) s += 60;
+    return s;
+}
+
+var ModifierCls = null;
+function doScan() {
+    var names;
+    try { names = Java.enumerateLoadedClassesSync(); } catch (e) { return []; }
+
+    var out = [], seen = {};
+    for (var i = 0; i < names.length; i++) {
+        var name = names[i];
+        if (seen[name]) continue; seen[name] = 1;
+        if (CONFIG.forceClass) { if (name !== CONFIG.forceClass) continue; }
+        else if (!shouldInspect(name)) continue;
+
+        var klass = resolve(name);
+        if (!klass) continue;
+
+        var methods;
+        try { methods = klass.class.getDeclaredMethods(); } catch (e) { continue; }
+        var isIface = false;
+        try { isIface = klass.class.isInterface(); } catch (e) {}
+
+        for (var j = 0; j < methods.length; j++) {
+            var m = methods[j], ptypes;
+            try { ptypes = m.getParameterTypes(); } catch (e) { continue; }
+            var sigUsed = matchSig(ptypes);
+            if (!sigUsed) continue;
+
+            if (!ModifierCls) ModifierCls = Java.use("java.lang.reflect.Modifier");
+            var mod = m.getModifiers();
+            var isStatic = ModifierCls.isStatic(mod);
+            var isAbstract = ModifierCls.isAbstract(mod);
+            var rType = m.getReturnType().getName();
+            var sc = staticScore(name, m.getName(), rType);
+            if (isIface) sc -= 20;
+            if (isAbstract) sc -= 10;
+
+            out.push({
+                className: name, methodName: m.getName(), returnType: rType,
+                klass: klass, sigUsed: sigUsed, isStatic: isStatic, loaderId: loaderId(klass),
+                score: sc, mode: "probe",
+                count: 0, firstMs: null, lastMs: null, thread: null, stack: null,
+                observedReturn: undefined, hitLogs: 0
+            });
+        }
+    }
+    return out;
+}
+
+/* ---------------- behaviour ---------------- */
+
+var ThreadCls = null;
+function threadName() {
+    try { if (!ThreadCls) ThreadCls = Java.use("java.lang.Thread"); return ThreadCls.currentThread().getName(); }
+    catch (e) { return "?"; }
+}
+
+function captureStack() {
+    try {
+        var E = Java.use("java.lang.Exception"), L = Java.use("android.util.Log");
+        return L.getStackTraceString(E.$new()).split("\n").slice(0, CONFIG.maxStackFrames).join("\n");
+    } catch (e) { return null; }
+}
+
+function recordHit(c) {
+    var now = Date.now() - startMs;
+    c.count++;
+    if (c.firstMs === null) {
+        c.firstMs = now;
+        c.thread  = threadName();
+        c.stack   = CONFIG.captureStack ? captureStack() : null;
+    }
+    c.lastMs = now;
+}
+
+// #2 caller-aware scoring
+var STARTUP_HINT = /Application|Activity|Splash|Launcher|MainActivity|onCreate|onStart|Bootstrap|AppEntry|\bInit\b/i;
+var LIB_HINT = /com\.google|okhttp|okio|kotlinx|retrofit|androidx|java\.lang\.reflect|dalvik\.system/i;
+
+function callerScore(c) {
+    if (!CONFIG.callerScoring || !c.stack) return 0;
+    var lines = c.stack.split("\n"), s = 0, startup = 0, appFrames = 0, libFrames = 0;
+    for (var i = 1; i < lines.length; i++) {          // skip the Exception frame
+        var l = lines[i];
+        if (STARTUP_HINT.test(l)) startup++;
+        if (LIB_HINT.test(l)) libFrames++;
+        else if (/at [a-z]\./.test(l)) appFrames++;
+    }
+    if (startup > 0) s += 30;
+    if (appFrames > 0) s += 10;
+    if (appFrames > 0 && libFrames === 0) s += 5;
+    return s;
+}
+
+function behaviouralScore(c) {
+    if (!c.count) return -30;
+    var s = 0;
+    if (c.count === 1) s += 55; else if (c.count === 2) s += 30; else if (c.count <= 5) s += 8; else s -= 20;
+    if (c.firstMs !== null) {
+        if (c.firstMs < 1500) s += 25; else if (c.firstMs < 4000) s += 12; else if (c.firstMs < 8000) s += 4;
+    }
+    if (c.thread && c.thread !== "main") s += 15;
+    if (c.count === 1 && c.firstMs !== null && c.firstMs < 2000) s += 15;
+    s += callerScore(c);
+    return s;
+}
+
+function totalScore(c) { return c.score + behaviouralScore(c); }
+
+/* ---------------- hooking ---------------- */
+
+var installed = {};
+
+function callOriginal(c, self, args) {
+    if (CONFIG.originalCallMode === "overload") {
+        var mm = c.klass[c.methodName];
+        return mm.overload.apply(mm, c.sigUsed).apply(self, args);
+    }
+    return self[c.methodName].apply(self, args);
+}
+
+function enforceValue(c) {
+    if (CONFIG.enforceReturn === "observed" && c.observedReturn !== undefined) return c.observedReturn;
+    if (CONFIG.enforceReturn === "custom") return CONFIG.customReturn;
+    return defaultFor(c.returnType);
+}
+
+function applyImplementation(c, ov) {
+    var ret = c.returnType, self = c;
+    ov.implementation = function () {
+        try {
+            recordHit(self);
+            if (CONFIG.logArgs && self.hitLogs < CONFIG.maxHitLogs) {
+                self.hitLogs++;
+                log("ARGS " + keyOf(self) + "(" + Array.prototype.join.call(arguments, ", ") + ")");
+            }
+            if (self.mode === "enforce") return enforceValue(self);
+            var v = callOriginal(self, this, arguments);
+            if (ret !== "void" && self.observedReturn === undefined) self.observedReturn = v;
+            return v;
+        } catch (e) {
+            log("hook error " + keyOf(self) + ": " + e);
+            try { return callOriginal(self, this, arguments); } catch (e2) { return defaultFor(ret); }
+        }
+    };
+}
+
+function installHook(c) {
+    if (installed[keyOf(c)]) return true;
+    try {
+        var method = c.klass[c.methodName];
+        var ov = method.overload.apply(method, c.sigUsed);
+        if (c.loaderId === undefined) c.loaderId = loaderId(c.klass);
+        applyImplementation(c, ov);
+        installed[keyOf(c)] = c;
+        return true;
+    } catch (e) { log("hook failed " + keyOf(c) + ": " + e); return false; }
+}
+
+function rearm(c) {
+    try { var m = c.klass[c.methodName]; applyImplementation(c, m.overload.apply(m, c.sigUsed)); } catch (e) {}
+}
+
+/* ---------------- #1 persistence ---------------- */
+
+var persistFile = null;
+function persistPath() {
+    if (persistFile) return persistFile;
+    if (CONFIG.persistPath) { persistFile = CONFIG.persistPath; return persistFile; }
+    try {
+        var ctx = Java.use("android.app.ActivityThread").currentApplication();
+        persistFile = ctx.getFilesDir().getAbsolutePath() + "/protecttai_targets.json";
+    } catch (e) { persistFile = "/data/local/tmp/protecttai_targets.json"; }
+    return persistFile;
+}
+
+function readStore() {
+    if (typeof File === "undefined") return {};
+    try { var f = new File(persistPath(), "r"); var t = f.readText(); f.close(); return JSON.parse(t); }
+    catch (e) { return {}; }
+}
+
+function writeStore(o) {
+    if (typeof File === "undefined") return false;
+    try { var f = new File(persistPath(), "w"); f.write(JSON.stringify(o, null, 2)); f.flush(); f.close(); return true; }
+    catch (e) { log("persist write failed: " + e); return false; }
+}
+
+var curPkg = null, curVer = 0;
+function storeKey() { return curPkg + "@" + curVer; }
+
+function saveTarget(c) {
+    if (!CONFIG.persist || !curPkg) return;
+    var store = readStore();
+    store[storeKey()] = {
+        target: keyOf(c), sig: c.sigUsed, returnType: c.returnType,
+        observedReturn: (c.observedReturn === undefined ? null : c.observedReturn),
+        enforceReturn: CONFIG.enforceReturn, score: c.score, confirmedAt: Date.now()
+    };
+    if (writeStore(store)) log("persisted " + keyOf(c) + " -> " + persistPath());
+}
+
+function tryPersisted() {
+    if (!persisted) return false;
+    var parts = persisted.target.split("#");
+    if (parts.length !== 2) return false;
+    var cls = resolve(parts[0]);
+    if (!cls) return false;
+    var m = cls[parts[1]];
+    if (!m) return false;
+    var sig = (persisted.sig && persisted.sig.length) ? persisted.sig : CONFIG.signatures[0];
+    try { m.overload.apply(m, sig); } catch (e) { return false; }
+
+    var c = {
+        className: parts[0], methodName: parts[1], returnType: persisted.returnType || "void",
+        klass: cls, sigUsed: sig, isStatic: false, loaderId: loaderId(cls),
+        score: persisted.score || 100, mode: "enforce",
+        count: 0, firstMs: null, lastMs: null, thread: null, stack: null,
+        observedReturn: (persisted.observedReturn === null || persisted.observedReturn === undefined) ? undefined : persisted.observedReturn,
+        hitLogs: 0
+    };
+    if (!installHook(c)) return false;
+    if (persisted.enforceReturn) CONFIG.enforceReturn = persisted.enforceReturn;
+    all.push(c);
+    decided = true; decidedAt = Date.now();
+    log("enforced PERSISTED target " + keyOf(c) + " : " + c.returnType);
+    startWatchdog();
+    return true;
+}
+
+/* ---------------- reporting ---------------- */
+
+function reportBehaviour(list) {
+    log("--- behaviour report ---");
+    list.slice().sort(function (a, b) { return totalScore(b) - totalScore(a); }).forEach(function (c, i) {
+        log("  [" + (i + 1) + "] " + keyOf(c) + "  mode=" + c.mode + "  calls=" + c.count +
+            "  first=" + (c.firstMs === null ? "-" : c.firstMs + "ms") + "  thread=" + (c.thread || "-") +
+            "  static=" + c.score + "  caller=" + callerScore(c) + "  total=" + totalScore(c));
+        if (c.stack) c.stack.split("\n").slice(1, 5).forEach(function (l) { log("        " + l.trim()); });
+    });
+}
+
+function summaryOf(c) {
+    return { target: keyOf(c), returnType: c.returnType, mode: c.mode, calls: c.count,
+             firstMs: c.firstMs, thread: c.thread, static: c.score,
+             caller: callerScore(c), behaviour: behaviouralScore(c) };
+}
+
+function sendSummary(phase) {
+    if (!CONFIG.jsonSummary) return;
+    try { send({ type: "protecttai", phase: phase, candidates: all.length, report: all.map(summaryOf) }); } catch (e) {}
+}
+
+/* ---------------- orchestration ---------------- */
+
+var all = [];
+var probing = false, decided = false, started = false, finished = false, rediscovering = false;
+var scanCount = 0, postRounds = 0, decidedAt = 0, persistAttempts = 0;
+var persisted = null;
+
+function finish() { finished = true; log("tick loop stopped (watchdog still armed)."); }
+
+function topCandidates() {
+    return all.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, CONFIG.maxProbeCandidates);
+}
+
+function promote(winner, list) {
+    list.forEach(function (c) { c.mode = (c === winner) ? "enforce" : "pass"; });
+    decided = true; decidedAt = Date.now(); rediscovering = false;
+    log(">> ENFORCING " + keyOf(winner) + " (static " + winner.score + " + behaviour " + behaviouralScore(winner) + " = " + totalScore(winner) + ")");
+    reportBehaviour(all);
+    sendSummary("enforced");
+    saveTarget(winner);
+    startWatchdog();
+}
+
+function enterProbe(list) {
+    probing = true;
+    list.forEach(function (c) { c.mode = "probe"; installHook(c); });
+    log("probing " + list.length + " candidate(s) for " + CONFIG.probeWindowMs + "ms");
+    if (CONFIG.mode === "probe") {
+        setTimeout(function () { reportBehaviour(all); sendSummary("probe"); finish(); }, CONFIG.probeWindowMs);
+        return;
+    }
+    setTimeout(decide, CONFIG.probeWindowMs);
+}
+
+function decide() {
+    if (decided || finished) return;
+    var called = all.filter(function (c) { return c.count > 0; });
+    if (!called.length) {
+        log("nothing called during probe -> falling back to static best");
+        promote(all.slice().sort(function (a, b) { return b.score - a.score; })[0], all);
+    } else {
+        called.sort(function (a, b) { return totalScore(b) - totalScore(a); });
+        promote(called[0], all);
+    }
+}
+
+function maybeEarlyPromote() {
+    if (decided || !CONFIG.earlyPromote) return;
+    var called = all.filter(function (c) { return c.count > 0; });
+    if (!called.length) return;
+    called.sort(function (a, b) { return totalScore(b) - totalScore(a); });
+    var top = called[0], second = called[1], now = Date.now() - startMs;
+    var oneShot = top.count === 1 && top.firstMs !== null && top.firstMs < 2500 && (now - top.firstMs) > 1200;
+    var ahead = !second || (totalScore(top) - totalScore(second)) >= 25;
+    if (oneShot && ahead) promote(top, all);
+}
+
+/* ---------------- #3 auto-heal ---------------- */
+
+var watchdogTimer = null;
+
+function startWatchdog() {
+    if (!CONFIG.watchdog || watchdogTimer) return;
+    watchdogTimer = setInterval(watchdogTick, CONFIG.watchdogIntervalMs);
+    log("watchdog armed (" + CONFIG.watchdogIntervalMs + "ms)");
+}
+
+function stopWatchdog() { if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; } }
+
+function watchdogTick() {
+    Java.perform(function () {
+        var enforced = all.filter(function (c) { return c.mode === "enforce"; });
+        if (!enforced.length) return;
+
+        enforced.forEach(function (c) {
+            var fresh = resolve(c.className);
+            if (!fresh) { log("watchdog: " + c.className + " not resolvable"); return; }
+            var curId = loaderId(fresh);
+            if (curId !== c.loaderId) {
+                log("watchdog: " + c.className + " reloaded (loader changed) -> re-hooking");
+                c.klass = fresh; c.loaderId = curId;
+                delete installed[keyOf(c)];
+                installHook(c);
+            } else {
+                rearm(c);
+            }
+        });
+
+        if (CONFIG.autoReDiscover && decidedAt && (Date.now() - decidedAt) > CONFIG.decoyGraceMs && !rediscovering) {
+            var decoy = enforced.filter(function (c) { return c.count === 0; })[0];
+            if (decoy) { log("watchdog: enforced " + keyOf(decoy) + " never fired -> re-discovering"); rediscovering = true; reDiscover(); }
+        }
+    });
+}
+
+function reDiscover() {
+    Java.perform(function () {
+        var fresh = doScan().filter(function (c) { return !findByKey(keyOf(c)) && !installed[keyOf(c)]; });
+        if (!fresh.length) { log("re-discover: no new candidates"); rediscovering = false; return; }
+        fresh.forEach(function (c) { all.push(c); });
+        decided = false;
+        enterProbe(topCandidates().filter(function (c) { return c.mode !== "enforce"; }));
+    });
+}
+
+/* ---------------- tick ---------------- */
+
+function nextInterval() {
+    if (scanCount < 10) return CONFIG.scanIntervalMs;
+    return Math.min(CONFIG.scanMaxIntervalMs, CONFIG.scanIntervalMs * (scanCount - 9));
+}
+
+function tick() { if (!finished) Java.perform(tickInner); }
+function scheduleNext() { if (!finished) setTimeout(tick, nextInterval()); }
+
+function tickInner() {
+    scanCount++;
+
+    if (!started && persisted && CONFIG.usePersisted && persistAttempts < CONFIG.persistRetries) {
+        persistAttempts++;
+        if (tryPersisted()) { started = true; finished = true; log("persisted fast-path engaged."); return; }
+        if (persistAttempts < CONFIG.persistRetries) { scheduleNext(); return; }
+        log("persisted target never resolved -> falling back to discovery");
+    }
+
+    var cands = doScan();
+    cands.forEach(function (c) { if (!installed[keyOf(c)] && !findByKey(keyOf(c))) all.push(c); });
+
+    if (!all.length) {
+        if (scanCount >= CONFIG.maxScans) { log("no candidates after " + scanCount + " scans."); finish(); }
+        else scheduleNext();
+        return;
+    }
+
+    if (CONFIG.mode === "report") {
+        log("--- " + all.length + " candidate(s) ---");
+        all.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).forEach(function (c, i) {
+            log("  [" + (i + 1) + "] score=" + c.score + "  " + keyOf(c) + " : " + c.returnType + (c.isStatic ? " [static]" : ""));
+        });
+        finish(); return;
+    }
+
+    if (!started) {
+        started = true;
+        if (all.length === 1 && CONFIG.mode === "hook") {
+            var c = all[0];
+            if (c.score < CONFIG.minScore) log("warning: single candidate has low static score " + c.score);
+            installHook(c); c.mode = "enforce"; decided = true; decidedAt = Date.now();
+            log("single candidate -> enforcing " + keyOf(c) + " (no probe)");
+            sendSummary("enforced"); saveTarget(c); startWatchdog();
+        } else {
+            enterProbe(topCandidates());
+        }
+    } else if (probing && !decided) {
+        all.forEach(function (c) { if (!installed[keyOf(c)]) installHook(c); });
+        if (CONFIG.mode === "hook") maybeEarlyPromote();
+    }
+
+    if (decided) { if (++postRounds >= CONFIG.postScans) finish(); else scheduleNext(); }
+    else scheduleNext();
+}
+
+/* ---------------- live control ---------------- */
+
+rpc.exports = {
+    status: function () {
+        return { mode: CONFIG.mode, decided: decided, probing: probing, rediscovering: rediscovering,
+                 candidates: all.length, persistPath: persistPath(),
+                 enforced: all.filter(function (c) { return c.mode === "enforce"; }).map(keyOf),
+                 top: all.slice().sort(function (a, b) { return totalScore(b) - totalScore(a); }).slice(0, 5).map(summaryOf) };
+    },
+    report: function () { Java.perform(function () { reportBehaviour(all); }); return all.length; },
+    enforce: function (k) { var c = findByKey(k); if (!c) return false; Java.perform(function () { promote(c, all); }); return true; },
+    probeAll: function () { Java.perform(function () { enterProbe(topCandidates()); }); return true; },
+    save: function () { var c = all.filter(function (x) { return x.mode === "enforce"; })[0]; if (c) saveTarget(c); return persistPath(); },
+    forget: function () { var ok = writeStore({}); persisted = null; return ok; },
+    rearm: function () { Java.perform(function () { all.forEach(function (c) { if (c.mode === "enforce") rearm(c); }); }); return true; },
+    setMode: function (m) { CONFIG.mode = m; return m; },
+    rescan: function () { Java.perform(tickInner); return all.length; },
+    stop: function () { stopWatchdog(); finished = true; return true; }
+};
+
+/* ---------------- go ---------------- */
+
+if (!Java.available) log("Java bridge unavailable - is this an Android app process?");
+
+Java.perform(function () {
+    try { curPkg = Java.use("android.app.ActivityThread").currentPackageName(); } catch (e) {}
+    if (CONFIG.autoPreset && curPkg && PRESETS[curPkg]) { SIGS = PRESETS[curPkg]; log("preset applied for " + curPkg); }
+
+    if (curPkg) {
+        try {
+            var pi = Java.use("android.app.ActivityThread").currentApplication()
+                        .getPackageManager().getPackageInfo(curPkg, 0);
+            curVer = pi.versionCode.value;
+        } catch (e) {}
+    }
+
+    if (CONFIG.persist) {
+        var store = readStore();
+        persisted = store[storeKey()] || null;
+        if (persisted) log("found persisted target " + persisted.target + " for " + storeKey());
+        else log("no persisted target for " + storeKey());
+    }
+
+    log("started; mode=" + CONFIG.mode + "; sigs=" + SIGS.length);
+    try { Process.enumerateModules().forEach(function (m) { if (/protect/i.test(m.name)) log("native module present: " + m.name); }); } catch (e) {}
+});
+
+setTimeout(tick, CONFIG.initialDelayMs);
