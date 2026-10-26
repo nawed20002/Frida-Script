@@ -1,0 +1,106 @@
+/* ============================================================
+ *  Protecttai-Bypass -> Frida port
+ *  Original Xposed module: github.com/reveny/Protecttai-Bypass
+ *  Target: Protectt.ai protection in Kotak Neo (com.kotak.neo)
+ *
+ *  Faithful port of:  f.g.u1(String,int,int,int,String,int)  +  setResult(null)
+ *
+ *  Run (spawn is recommended so the hook is live before Protectt runs):
+ *    frida -U -f com.kotak.neo -l protecttai_bypass.js --no-pause
+ *  Attach to an already-running app instead:
+ *    frida -U -n Kotak -l protecttai_bypass.js
+ * ============================================================ */
+
+var CONFIG = {
+    className:    "f.g",
+    methodName:   "u1",
+    // exact Java parameter types, in order:
+    signature:    ["java.lang.String", "int", "int", "int", "java.lang.String", "int"],
+    maxAttempts:  150,   // class may not be loaded yet -> retry
+    retryDelayMs: 100,
+    verbose:      true
+};
+
+function log(m) { if (CONFIG.verbose) console.log("[protecttai] " + m); }
+
+// Xposed returned null via setResult(null); map that to a type-safe default.
+function defaultFor(typeName) {
+    switch (typeName) {
+        case "void":    return undefined;
+        case "boolean": return false;
+        case "byte":
+        case "short":
+        case "char":
+        case "int":
+        case "long":
+        case "float":
+        case "double":  return 0;
+        default:        return null;   // objects / arrays
+    }
+}
+
+function findClass(name) {
+    // 1) default (app) class loader
+    try { var k = Java.use(name); if (k) return k; } catch (e) {}
+
+    // 2) walk every class loader (Protectt may load classes dynamically)
+    var found = null, loaders = [];
+    try { loaders = Java.enumerateClassLoadersSync(); }
+    catch (e) {
+        Java.enumerateClassLoaders({
+            onMatch:    function (l) { loaders.push(l); },
+            onComplete: function () {}
+        });
+    }
+    loaders.forEach(function (loader) {
+        if (found) return;
+        try {
+            if (loader.findClass(name)) {
+                Java.classFactory.loader = loader;  // pin the right loader
+                found = Java.use(name);
+            }
+        } catch (e) {}
+    });
+    return found;
+}
+
+var done = false;
+
+function attempt() {
+    if (done) return true;
+
+    var klass = findClass(CONFIG.className);
+    if (!klass) return false;
+
+    var method = klass[CONFIG.methodName];
+    if (!method) { log("class " + CONFIG.className + " found, but no method " + CONFIG.methodName); return false; }
+
+    var overload;
+    try {
+        overload = method.overload.apply(method, CONFIG.signature);
+    } catch (e) {
+        log("signature mismatch for " + CONFIG.className + "." + CONFIG.methodName + ". Available overloads:");
+        method.overloads.forEach(function (o) { log("   " + o); });
+        return false;
+    }
+
+    var ret = overload.returnType.className;
+
+    overload.implementation = function () {
+        log("HIT " + CONFIG.className + "." + CONFIG.methodName + " -> returning default (" + ret + ")");
+        return defaultFor(ret);   // <- equivalent of param.setResult(null)
+    };
+
+    log("hooked " + CONFIG.className + "." + CONFIG.methodName + " -> " + ret + "  (Protectt bypassed)");
+    done = true;
+    return true;
+}
+
+Java.perform(function () {
+    var n = 0;
+    (function tick() {
+        if (attempt()) return;
+        if (++n >= CONFIG.maxAttempts) { log("gave up after " + n + " tries - is the app running?"); return; }
+        setTimeout(tick, CONFIG.retryDelayMs);
+    })();
+});
