@@ -1,0 +1,222 @@
+/* ============================================================
+ *  Protecttai-Bypass -> Frida port  [AUTO-DISCOVERY EDITION]
+ *  Original Xposed module: github.com/reveny/Protecttai-Bypass
+ *
+ *  Discovers the hook target at runtime instead of hardcoding f.g.u1.
+ *
+ *  RECOMMENDED FIRST RUN (verify, don't hook):
+ *      set CONFIG.mode = "report"  below
+ *      frida -U -f com.kotak.neo -l protecttai_autodiscover.js --no-pause
+ *
+ *  THEN to actually bypass:
+ *      set CONFIG.mode = "hook"
+ *      frida -U -f com.kotak.neo -l protecttai_autodiscover.js --no-pause
+ *
+ *  Known target? skip discovery entirely:  CONFIG.forceClass = "f.g"
+ * ============================================================ */
+
+'use strict';
+
+var CONFIG = {
+    // exact Java parameter types of the target method, in order:
+    signature: ["java.lang.String", "int", "int", "int", "java.lang.String", "int"],
+
+    mode:        "hook",   // "report" = list candidates only | "hook" = bypass
+    hookAll:     false,    // true = hook EVERY candidate (noisier, riskier)
+    forceClass:  null,     // e.g. "f.g" -> skip discovery and target this class
+    behavior:    "skip",   // "skip" = setResult(null) | "call" = run original
+    logArgs:     false,    // log call arguments on each hit
+
+    minScore:        40,   // candidates below this are flagged
+    initialDelayMs:  300,  // wait before first scan (let app load)
+    scanIntervalMs:  500,  // delay between scans
+    maxScans:        120,  // give up after this many scans if nothing found
+    postScans:       4,    // extra scans after first hook, to catch late loads
+    verbose:         true
+};
+
+var SIG = CONFIG.signature;
+
+function log(m) { if (CONFIG.verbose) console.log("[protecttai] " + m); }
+
+function defaultFor(t) {
+    switch (t) {
+        case "void":    return undefined;
+        case "boolean": return false;
+        case "byte": case "short": case "char":
+        case "int":  case "long":  case "float": case "double": return 0;
+        default:        return null;   // objects / arrays
+    }
+}
+
+function keyOf(c) { return c.className + "#" + c.methodName; }
+
+// System + popular third-party libs we can safely ignore.
+var SKIP = /^(java|javax|sun|com\.sun|jdk|android|androidx|dalvik|kotlin|kotlinx|org\.apache|org\.json|org\.xml|org\.w3c|org\.bouncycastle|junit|com\.google|com\.facebook|okhttp3|okio|retrofit2|com\.squareup|io\.reactivex|com\.crashlytics|com\.fasterxml|com\.newrelic|com\.appsflyer|com\.adjust|com\.clevertap|com\.moengage|com\.mixpanel|com\.bugsnag|com\.sentry|bolts|net\.sqlcipher|com\.github|de\.robv)\./;
+
+function shouldInspect(name) {
+    if (!name || name[0] === "[") return false;
+    if (/protect/i.test(name)) return true;      // never skip these
+    return !SKIP.test(name);
+}
+
+function resolve(name) {
+    try { return Java.use(name); } catch (e) {}
+    // fallback: some classes live in a child/dynamic class loader
+    try {
+        var loaders = Java.enumerateClassLoadersSync();
+        for (var i = 0; i < loaders.length; i++) {
+            try { var c = loaders[i].loadClass(name); if (c) return c; } catch (e) {}
+        }
+    } catch (e) {}
+    return null;
+}
+
+function score(className, methodName, returnType) {
+    var s = 0;
+    var segs = className.split(".");
+    var allShort    = segs.every(function (x) { return x.length <= 2; });
+    var mostlyShort = segs.every(function (x) { return x.length <= 3; });
+    if (allShort) s += 45; else if (mostlyShort) s += 25;
+
+    if (/^[a-z]{1,2}[0-9]?$/.test(methodName)) s += 25;
+    else if (methodName.length <= 3) s += 12;
+
+    if (segs.length === 2 && segs[0].length <= 2) s += 15;   // f.g / a.b style
+
+    if (returnType === "void" || returnType === "boolean") s += 6;
+
+    if (/protect/i.test(className)) s += 60;
+    return s;
+}
+
+function doScan() {
+    var names;
+    try { names = Java.enumerateLoadedClassesSync(); } catch (e) { return []; }
+
+    var out = [], seen = {};
+    for (var i = 0; i < names.length; i++) {
+        var name = names[i];
+        if (seen[name]) continue; seen[name] = 1;
+        if (CONFIG.forceClass) { if (name !== CONFIG.forceClass) continue; }
+        else if (!shouldInspect(name)) continue;
+
+        var klass = resolve(name);
+        if (!klass) continue;
+
+        var methods;
+        try { methods = klass.class.getDeclaredMethods(); } catch (e) { continue; }
+
+        for (var j = 0; j < methods.length; j++) {
+            var m = methods[j], ptypes;
+            try { ptypes = m.getParameterTypes(); } catch (e) { continue; }
+            if (ptypes.length !== SIG.length) continue;
+
+            var ok = true;
+            for (var k = 0; k < ptypes.length; k++) {
+                if (ptypes[k].getName() !== SIG[k]) { ok = false; break; }
+            }
+            if (!ok) continue;
+
+            var mName = m.getName();
+            var rType = m.getReturnType().getName();
+            out.push({
+                className: name, methodName: mName, returnType: rType,
+                klass: klass, score: score(name, mName, rType)
+            });
+        }
+    }
+    return out;
+}
+
+function hookCandidate(c) {
+    try {
+        var method = c.klass[c.methodName];
+        var ov  = method.overload.apply(method, SIG);
+        var ret = c.returnType;
+
+        if (CONFIG.behavior === "call") {
+            ov.implementation = function () {
+                if (CONFIG.logArgs) log("ARGS " + c.className + "." + c.methodName + "(" + Array.prototype.join.call(arguments, ", ") + ")");
+                return this[c.methodName].apply(this, arguments);
+            };
+        } else {
+            ov.implementation = function () {
+                if (CONFIG.logArgs) log("ARGS " + c.className + "." + c.methodName + "(" + Array.prototype.join.call(arguments, ", ") + ")");
+                log("HIT " + c.className + "." + c.methodName + " -> default(" + ret + ")");
+                return defaultFor(ret);   // == Xposed param.setResult(null)
+            };
+        }
+        log("HOOKED " + c.className + "." + c.methodName + " : " + ret + "  (score " + c.score + ")");
+        return true;
+    } catch (e) {
+        log("hook failed for " + c.className + "." + c.methodName + ": " + e);
+        return false;
+    }
+}
+
+var hooked = {}, anyHooked = false, finished = false, scanCount = 0, postRounds = 0;
+
+function finish() { finished = true; log("discovery stopped."); }
+
+function tick() {
+    if (finished) return;
+    scanCount++;
+
+    var cands;
+    Java.perform(function () { cands = doScan(); });
+
+    // keep only not-yet-hooked, deduped
+    var fresh = [], key = {};
+    cands.forEach(function (c) {
+        var k = keyOf(c);
+        if (hooked[k] || key[k]) return;
+        key[k] = 1; fresh.push(c);
+    });
+
+    if (fresh.length) {
+        fresh.sort(function (a, b) { return b.score - a.score; });
+
+        if (!anyHooked) {
+            log("--- " + fresh.length + " candidate(s) ---");
+            fresh.slice(0, 10).forEach(function (c, i) {
+                log("  [" + (i + 1) + "] score=" + c.score + "  " + c.className + "." + c.methodName + " : " + c.returnType);
+            });
+            if (CONFIG.mode === "report") { finish(); return; }
+
+            var best = fresh[0];
+            if (best.score < CONFIG.minScore) log("warning: best score " + best.score + " < minScore " + CONFIG.minScore);
+
+            if (CONFIG.hookAll) {
+                fresh.forEach(function (c) { if (hookCandidate(c)) { hooked[keyOf(c)] = 1; anyHooked = true; } });
+            } else {
+                if (hookCandidate(best)) { hooked[keyOf(best)] = 1; anyHooked = true; }
+            }
+        } else {
+            // already hooked -> pick up newly-loaded plausible targets
+            fresh.forEach(function (c) {
+                if (c.score >= CONFIG.minScore && hookCandidate(c)) hooked[keyOf(c)] = 1;
+            });
+        }
+    }
+
+    if (anyHooked) {
+        if (++postRounds >= CONFIG.postScans) finish();
+        else setTimeout(tick, CONFIG.scanIntervalMs);
+    } else if (scanCount >= CONFIG.maxScans) {
+        log("no candidates after " + scanCount + " scans. Signature may differ, or target not present.");
+        finish();
+    } else {
+        setTimeout(tick, CONFIG.scanIntervalMs);
+    }
+}
+
+log("auto-discovery started; signature = (" + SIG.join(", ") + ")");
+
+try {
+    Process.enumerateModules().forEach(function (m) {
+        if (/protect/i.test(m.name)) log("native module present: " + m.name);
+    });
+} catch (e) {}
+
+setTimeout(tick, CONFIG.initialDelayMs);
