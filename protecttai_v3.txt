@@ -1,0 +1,436 @@
+/* ============================================================
+ *  Protecttai-Bypass -> Frida port  [v3: hardened]
+ *  Original Xposed module: github.com/reveny/Protecttai-Bypass
+ *
+ *  Signature auto-discovery + behavioural probing + crash-safe hooks
+ *  + live RPC control.
+ *
+ *  MODES: "report" | "probe" | "hook"
+ *  Run:  frida -U -f com.kotak.neo -l protecttai_v3.js --no-pause
+ *
+ *  Live (in the REPL):
+ *    rpc.exports.status()
+ *    rpc.exports.report()
+ *    rpc.exports.enforce("f.g#u1")
+ *    rpc.exports.setMode("probe")
+ * ============================================================ */
+
+'use strict';
+
+var CONFIG = {
+    // ---- matching ----
+    signatures: [["java.lang.String", "int", "int", "int", "java.lang.String", "int"]],
+    matchMode:    "exact",    // "exact" | "argcount"
+    includeClasses: null,     // regex string, e.g. "^(f|g|h)\\."
+    excludeClasses: null,
+    forceClass:   null,       // e.g. "f.g"
+    autoPreset:   true,
+
+    // ---- behaviour ----
+    mode:          "hook",    // "report" | "probe" | "hook"
+    enforceReturn: "default", // "default" | "observed" | "custom"
+    customReturn:  null,
+    originalCallMode: "this", // "this" (safe) | "overload" (exact, may recurse)
+    logArgs:       false,
+    maxHitLogs:    5,
+
+    // ---- discovery ----
+    minScore:        40,
+    initialDelayMs:  300,
+    scanIntervalMs:  500,
+    scanMaxIntervalMs: 4000,
+    maxScans:        120,
+    postScans:       4,
+    maxProbeCandidates: 12,
+
+    // ---- probing ----
+    probeWindowMs:  4000,
+    earlyPromote:   true,
+    captureStack:   true,
+    maxStackFrames: 6,
+
+    // ---- output ----
+    verbose:     true,
+    jsonSummary: true,
+    tag:         "[protecttai]"
+};
+
+var PRESETS = {
+    "com.kotak.neo":               [["java.lang.String", "int", "int", "int", "java.lang.String", "int"]],
+    "com.csam.icici.bank.imobile": [["java.lang.String", "int", "int", "int", "java.lang.String", "int"]]
+};
+
+var SIGS = CONFIG.signatures;
+var startMs = Date.now();
+
+function log(m) { if (CONFIG.verbose) console.log(CONFIG.tag + " " + m); }
+function keyOf(c) { return c.className + "#" + c.methodName; }
+function findByKey(k) { for (var i = 0; i < all.length; i++) if (keyOf(all[i]) === k) return all[i]; return null; }
+
+function defaultFor(t) {
+    switch (t) {
+        case "void":    return undefined;
+        case "boolean": return false;
+        case "byte": case "short": case "char":
+        case "int":  case "long":  case "float": case "double": return 0;
+        default:        return null;
+    }
+}
+
+/* ---------------- matching ---------------- */
+
+var INCLUDE_RE = null, EXCLUDE_RE = null;
+try { if (CONFIG.includeClasses) INCLUDE_RE = new RegExp(CONFIG.includeClasses); } catch (e) {}
+try { if (CONFIG.excludeClasses) EXCLUDE_RE = new RegExp(CONFIG.excludeClasses); } catch (e) {}
+
+var SKIP = /^(java|javax|sun|com\.sun|jdk|android|androidx|dalvik|kotlin|kotlinx|org\.apache|org\.json|org\.xml|org\.w3c|org\.bouncycastle|junit|com\.google|com\.facebook|okhttp3|okio|retrofit2|com\.squareup|io\.reactivex|com\.crashlytics|com\.fasterxml|com\.newrelic|com\.appsflyer|com\.adjust|com\.clevertap|com\.moengage|com\.mixpanel|com\.bugsnag|com\.sentry|bolts|net\.sqlcipher|com\.github|de\.robv)\./;
+
+function shouldInspect(name) {
+    if (!name || name[0] === "[") return false;
+    if (EXCLUDE_RE && EXCLUDE_RE.test(name)) return false;
+    if (INCLUDE_RE) return INCLUDE_RE.test(name);
+    if (/protect/i.test(name)) return true;
+    return !SKIP.test(name);
+}
+
+function resolve(name) {
+    try { return Java.use(name); } catch (e) {}
+    try {
+        var loaders = Java.enumerateClassLoadersSync();
+        for (var i = 0; i < loaders.length; i++) {
+            try { var c = loaders[i].loadClass(name); if (c) return c; } catch (e) {}
+        }
+    } catch (e) {}
+    return null;
+}
+
+function matchSig(ptypes) {
+    var names = [];
+    for (var i = 0; i < ptypes.length; i++) names.push(ptypes[i].getName());
+    for (var s = 0; s < SIGS.length; s++) {
+        var sig = SIGS[s];
+        if (sig.length !== names.length) continue;
+        if (CONFIG.matchMode === "argcount") return names;
+        var ok = true;
+        for (var k = 0; k < sig.length; k++) if (sig[k] !== names[k]) { ok = false; break; }
+        if (ok) return names;
+    }
+    return null;
+}
+
+function staticScore(className, methodName, returnType) {
+    var s = 0, segs = className.split(".");
+    var allShort    = segs.every(function (x) { return x.length <= 2; });
+    var mostlyShort = segs.every(function (x) { return x.length <= 3; });
+    if (allShort) s += 45; else if (mostlyShort) s += 25;
+    if (/^[a-z]{1,2}[0-9]?$/.test(methodName)) s += 25;
+    else if (methodName.length <= 3) s += 12;
+    if (segs.length === 2 && segs[0].length <= 2) s += 15;
+    if (returnType === "void" || returnType === "boolean") s += 6;
+    if (/protect/i.test(className)) s += 60;
+    return s;
+}
+
+var ModifierCls = null;
+function doScan() {
+    var names;
+    try { names = Java.enumerateLoadedClassesSync(); } catch (e) { return []; }
+
+    var out = [], seen = {};
+    for (var i = 0; i < names.length; i++) {
+        var name = names[i];
+        if (seen[name]) continue; seen[name] = 1;
+        if (CONFIG.forceClass) { if (name !== CONFIG.forceClass) continue; }
+        else if (!shouldInspect(name)) continue;
+
+        var klass = resolve(name);
+        if (!klass) continue;
+
+        var methods;
+        try { methods = klass.class.getDeclaredMethods(); } catch (e) { continue; }
+        var isIface = false;
+        try { isIface = klass.class.isInterface(); } catch (e) {}
+
+        for (var j = 0; j < methods.length; j++) {
+            var m = methods[j], ptypes;
+            try { ptypes = m.getParameterTypes(); } catch (e) { continue; }
+            var sigUsed = matchSig(ptypes);
+            if (!sigUsed) continue;
+
+            if (!ModifierCls) ModifierCls = Java.use("java.lang.reflect.Modifier");
+            var mod = m.getModifiers();
+            var isStatic = ModifierCls.isStatic(mod);
+            var isAbstract = ModifierCls.isAbstract(mod);
+            var rType = m.getReturnType().getName();
+            var sc = staticScore(name, m.getName(), rType);
+            if (isIface) sc -= 20;
+            if (isAbstract) sc -= 10;
+
+            out.push({
+                className: name, methodName: m.getName(), returnType: rType,
+                klass: klass, sigUsed: sigUsed, isStatic: isStatic,
+                score: sc, mode: "probe",
+                count: 0, firstMs: null, lastMs: null, thread: null, stack: null,
+                observedReturn: undefined, hitLogs: 0
+            });
+        }
+    }
+    return out;
+}
+
+/* ---------------- behaviour ---------------- */
+
+var ThreadCls = null;
+function threadName() {
+    try { if (!ThreadCls) ThreadCls = Java.use("java.lang.Thread"); return ThreadCls.currentThread().getName(); }
+    catch (e) { return "?"; }
+}
+
+function captureStack() {
+    try {
+        var E = Java.use("java.lang.Exception"), L = Java.use("android.util.Log");
+        return L.getStackTraceString(E.$new()).split("\n").slice(0, CONFIG.maxStackFrames).join("\n");
+    } catch (e) { return null; }
+}
+
+function recordHit(c) {
+    var now = Date.now() - startMs;
+    c.count++;
+    if (c.firstMs === null) {
+        c.firstMs = now;
+        c.thread  = threadName();
+        c.stack   = CONFIG.captureStack ? captureStack() : null;
+    }
+    c.lastMs = now;
+}
+
+function behaviouralScore(c) {
+    if (!c.count) return -30;
+    var s = 0;
+    if (c.count === 1) s += 55; else if (c.count === 2) s += 30; else if (c.count <= 5) s += 8; else s -= 20;
+    if (c.firstMs !== null) {
+        if (c.firstMs < 1500) s += 25; else if (c.firstMs < 4000) s += 12; else if (c.firstMs < 8000) s += 4;
+    }
+    if (c.thread && c.thread !== "main") s += 15;
+    if (c.count === 1 && c.firstMs !== null && c.firstMs < 2000) s += 15;
+    return s;
+}
+
+function totalScore(c) { return c.score + behaviouralScore(c); }
+
+/* ---------------- hooking (crash-safe) ---------------- */
+
+var installed = {};
+
+function callOriginal(c, self, args) {
+    if (CONFIG.originalCallMode === "overload") {
+        var mm = c.klass[c.methodName];
+        return mm.overload.apply(mm, c.sigUsed).apply(self, args);
+    }
+    return self[c.methodName].apply(self, args);
+}
+
+function enforceValue(c) {
+    if (CONFIG.enforceReturn === "observed" && c.observedReturn !== undefined) return c.observedReturn;
+    if (CONFIG.enforceReturn === "custom") return CONFIG.customReturn;
+    return defaultFor(c.returnType);
+}
+
+function installHook(c) {
+    if (installed[keyOf(c)]) return true;
+    try {
+        var method = c.klass[c.methodName];
+        var ov = method.overload.apply(method, c.sigUsed);
+        var ret = c.returnType;
+        var self = c;
+
+        ov.implementation = function () {
+            try {
+                recordHit(self);
+                if (CONFIG.logArgs && self.hitLogs < CONFIG.maxHitLogs) {
+                    self.hitLogs++;
+                    log("ARGS " + keyOf(self) + "(" + Array.prototype.join.call(arguments, ", ") + ")");
+                }
+                if (self.mode === "enforce") return enforceValue(self);
+                var v = callOriginal(self, this, arguments);
+                if (ret !== "void" && self.observedReturn === undefined) self.observedReturn = v;
+                return v;
+            } catch (e) {
+                log("hook error " + keyOf(self) + ": " + e);
+                try { return callOriginal(self, this, arguments); } catch (e2) { return defaultFor(ret); }
+            }
+        };
+        installed[keyOf(c)] = c;
+        return true;
+    } catch (e) { log("hook failed " + keyOf(c) + ": " + e); return false; }
+}
+
+/* ---------------- reporting ---------------- */
+
+function reportBehaviour(list) {
+    log("--- behaviour report ---");
+    list.slice().sort(function (a, b) { return totalScore(b) - totalScore(a); }).forEach(function (c, i) {
+        log("  [" + (i + 1) + "] " + keyOf(c) + "  mode=" + c.mode + "  calls=" + c.count +
+            "  first=" + (c.firstMs === null ? "-" : c.firstMs + "ms") +
+            "  thread=" + (c.thread || "-") + "  static=" + c.score + "  total=" + totalScore(c));
+        if (c.stack) c.stack.split("\n").slice(0, 4).forEach(function (l) { log("        " + l.trim()); });
+    });
+}
+
+function summaryOf(c) {
+    return { target: keyOf(c), returnType: c.returnType, mode: c.mode, calls: c.count,
+             firstMs: c.firstMs, thread: c.thread, static: c.score, behaviour: behaviouralScore(c) };
+}
+
+function sendSummary(phase) {
+    if (!CONFIG.jsonSummary) return;
+    try { send({ type: "protecttai", phase: phase, candidates: all.length, report: all.map(summaryOf) }); } catch (e) {}
+}
+
+/* ---------------- orchestration ---------------- */
+
+var all = [], installedCount = 0;
+var probing = false, decided = false, started = false, finished = false;
+var scanCount = 0, postRounds = 0;
+
+function finish() {
+    finished = true;
+    // post-run sanity: did we enforce something that never fires?
+    all.filter(function (c) { return c.mode === "enforce" && c.count === 0; }).forEach(function (c) {
+        log("WARNING: enforced " + keyOf(c) + " was never called during the run - possible decoy");
+    });
+    log("stopped.");
+}
+
+function topCandidates() {
+    return all.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, CONFIG.maxProbeCandidates);
+}
+
+function promote(winner, list) {
+    list.forEach(function (c) { c.mode = (c === winner) ? "enforce" : "pass"; });
+    log(">> ENFORCING " + keyOf(winner) + " (static " + winner.score + " + behaviour " + behaviouralScore(winner) + " = " + totalScore(winner) + ")");
+    reportBehaviour(all);
+    sendSummary("enforced");
+}
+
+function enterProbe(list) {
+    probing = true;
+    list.forEach(function (c) { c.mode = "probe"; installHook(c); });
+    log("probing " + list.length + " candidate(s) for " + CONFIG.probeWindowMs + "ms");
+    if (CONFIG.mode === "probe") {
+        setTimeout(function () { reportBehaviour(all); sendSummary("probe"); finish(); }, CONFIG.probeWindowMs);
+        return;
+    }
+    setTimeout(decide, CONFIG.probeWindowMs);
+}
+
+function decide() {
+    if (decided || finished) return;
+    decided = true;
+    var called = all.filter(function (c) { return c.count > 0; });
+    if (!called.length) {
+        var best = all.slice().sort(function (a, b) { return b.score - a.score; })[0];
+        log("nothing called during probe -> falling back to static best");
+        promote(best, all);
+    } else {
+        called.sort(function (a, b) { return totalScore(b) - totalScore(a); });
+        promote(called[0], all);
+    }
+}
+
+function maybeEarlyPromote() {
+    if (decided || !CONFIG.earlyPromote) return;
+    var called = all.filter(function (c) { return c.count > 0; });
+    if (!called.length) return;
+    called.sort(function (a, b) { return totalScore(b) - totalScore(a); });
+    var top = called[0], second = called[1], now = Date.now() - startMs;
+    var oneShot = top.count === 1 && top.firstMs !== null && top.firstMs < 2500 && (now - top.firstMs) > 1200;
+    var ahead = !second || (totalScore(top) - totalScore(second)) >= 25;
+    if (oneShot && ahead) { decided = true; promote(top, all); }
+}
+
+function tick() { if (!finished) Java.perform(tickInner); }
+
+function tickInner() {
+    scanCount++;
+    var cands = doScan();
+
+    cands.forEach(function (c) {
+        if (!installed[keyOf(c)] && !findByKey(keyOf(c))) all.push(c);
+    });
+
+    if (!all.length) {
+        if (scanCount >= CONFIG.maxScans) { log("no candidates after " + scanCount + " scans."); finish(); }
+        else setTimeout(tick, nextInterval());
+        return;
+    }
+
+    if (CONFIG.mode === "report") {
+        log("--- " + all.length + " candidate(s) ---");
+        all.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).forEach(function (c, i) {
+            log("  [" + (i + 1) + "] score=" + c.score + "  " + keyOf(c) + " : " + c.returnType + (c.isStatic ? " [static]" : ""));
+        });
+        finish(); return;
+    }
+
+    if (!started) {
+        started = true;
+        if (all.length === 1 && CONFIG.mode === "hook") {
+            var c = all[0];
+            if (c.score < CONFIG.minScore) log("warning: single candidate has low static score " + c.score);
+            installHook(c); c.mode = "enforce"; decided = true;
+            log("single candidate -> enforcing " + keyOf(c) + " (no probe)");
+            sendSummary("enforced");
+        } else {
+            enterProbe(topCandidates());
+        }
+    } else if (probing && !decided) {
+        all.forEach(function (c) { if (!installed[keyOf(c)]) installHook(c); });
+        if (CONFIG.mode === "hook") maybeEarlyPromote();
+    }
+
+    if (decided) {
+        if (++postRounds >= CONFIG.postScans) finish();
+        else setTimeout(tick, nextInterval());
+    } else {
+        setTimeout(tick, nextInterval());
+    }
+}
+
+function nextInterval() {
+    if (scanCount < 10) return CONFIG.scanIntervalMs;
+    return Math.min(CONFIG.scanMaxIntervalMs, CONFIG.scanIntervalMs * (scanCount - 9));
+}
+
+/* ---------------- live control ---------------- */
+
+rpc.exports = {
+    status: function () {
+        return { mode: CONFIG.mode, decided: decided, probing: probing, candidates: all.length,
+                 enforced: all.filter(function (c) { return c.mode === "enforce"; }).map(keyOf),
+                 top: all.slice().sort(function (a, b) { return totalScore(b) - totalScore(a); }).slice(0, 5).map(summaryOf) };
+    },
+    report: function () { Java.perform(function () { reportBehaviour(all); }); return all.length; },
+    enforce: function (key) { var c = findByKey(key); if (!c) return false; Java.perform(function () { promote(c, all); }); return true; },
+    probeAll: function () { Java.perform(function () { enterProbe(topCandidates()); }); return true; },
+    setMode: function (m) { CONFIG.mode = m; return m; },
+    setForceClass: function (n) { CONFIG.forceClass = n; return n; },
+    rescan: function () { Java.perform(tickInner); return all.length; }
+};
+
+/* ---------------- go ---------------- */
+
+if (!Java.available) log("Java bridge unavailable - is this an Android app process?");
+
+Java.perform(function () {
+    if (CONFIG.autoPreset) {
+        try {
+            var pkg = Java.use("android.app.ActivityThread").currentPackageName();
+            if (pkg && PRESETS[pkg]) { SIGS = PRESETS[pkg]; log("preset applied for " + pkg); }
+        } catch (e) {}
+    }
+    log("started; mode=" + CONFIG.mode + "; sigs=" + SIGS.length + "; match=" + CONFIG.matchMode);
+    try { Process.enumerateModules().forEach(function (m) { if (/protect/i.test(m.name)) log("native module present: " + m.name); }); } catch (e) {}
+});
+
+setTimeout(tick, CONFIG.initialDelayMs);
